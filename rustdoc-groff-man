@@ -78,6 +78,9 @@ def find_fn_impl(index: dict, fn_key: int) -> str | None:
 def get_qual_name(qual: list, name: str) -> str:
     return "::".join(name for typ, name in qual + [["", name]])
 
+def format_trait(trait: dict) -> str:
+    return trait["path"]
+
 def compute_qual_names(index: dict, root: int, curr=[]):
     item = index[str(root)]
     name = item["name"]
@@ -89,10 +92,15 @@ def compute_qual_names(index: dict, root: int, curr=[]):
                 compute_qual_names(index, child, curr + [[typ, name]])
         case {"struct": struct}:
             for impl in struct["impls"]:
-                compute_qual_names(index, impl, curr + [["impl", name]])
+                compute_qual_names(index, impl, curr)
         case {"impl": impl}:
+            if impl["trait"] is None:
+                impl_kw = "impl"
+            else:
+                impl_kw = f"impl {format_trait(impl['trait'])} for"
+            impl_name = format_type(impl["for"])
             for item in impl["items"]:
-                compute_qual_names(index, item, curr)
+                compute_qual_names(index, item, curr + [[impl_kw, impl_name]])
 
 def format_struct_or_variant(index: dict, struct: dict, terminator: str = ";") -> str:
     match struct["kind"]:
@@ -204,9 +212,9 @@ def format_item(index: dict, item: dict, f: IO[str]):
 
                 for variant_key in enum["variants"]:
                     variant = index[str(variant_key)]
-                    print(variant["name"] + format_struct_or_variant(index, index[str(variant_key)]["inner"]["variant"], terminator=","), file=f, end="\n.br")
+                    print(variant["name"] + format_struct_or_variant(index, index[str(variant_key)]["inner"]["variant"], terminator=","), file=f, end="\n.br\n")
 
-                print("\n.RE", file=f)
+                print(".RE", file=f)
                 print("}\n.br", file=f)
             case {"module": {"is_crate": is_crate, "items": items}}:
                 kw = "crate" if is_crate else "mod"
@@ -229,6 +237,12 @@ def format_item(index: dict, item: dict, f: IO[str]):
         print("-------------------------------------------------")
         raise
 
+def format_impl(impl: dict) -> str:
+    if impl["trait"] is None:
+        return f"impl {format_type(impl['for'])}"
+    else:
+        return f"impl {format_trait(impl['trait'])} for {format_type(impl['for'])}"
+
 def main() -> None:
     dirname = "man"
 
@@ -239,9 +253,6 @@ def main() -> None:
     index = file["index"]
     compute_qual_names(index, file["root"])
     for key, value in index.items():
-        if value["crate_id"] != 0:
-            continue
-
         name = value["name"]
         if name is None or "qual" not in value:
             continue
@@ -269,6 +280,24 @@ def main() -> None:
             print(".EX", file=f)
             print(value['docs'], file=f)
             print(".EE", file=f)
+
+            if "struct" in value["inner"] or "enum" in value["inner"] or "union" in value["inner"]:
+                impls = sorted(next(iter(value["inner"].values()))["impls"], key=lambda impl_key: index[str(impl_key)]["span"] is None)
+                print(".SH IMPLS", file=f)
+                for impl_key in impls:
+                    impl = index[str(impl_key)]["inner"]["impl"]
+                    if len(impl["items"]) > 0:
+                        print(f"{format_impl(impl)} {{", file=f)
+                        print(".RS", file=f)
+
+                        for item_key in impl["items"]:
+                            item = index[str(item_key)]
+                            format_item(index, item, f)
+
+                        print(".RE", file=f)
+                        print("}\n.br\n", file=f)
+                    else:
+                        print(f"{format_impl(impl)} {{}}\n.br", file=f)
 
             print(".SH JSON", file=f)
             print(".EX", file=f)
