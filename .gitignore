@@ -1,0 +1,7 @@
+*.json
+foo.rs
+doc/
+man/
+.mypy_cache/
+log.txt
+

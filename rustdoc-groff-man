@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+# While everyone else is writing Python tooling in Rust, I'm writing Rust tooling in Python
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+def pprint_json(obj):
+    json.dump(obj, sys.stdout, indent=4)
+    print()
+
+def mkdir_if_not_exists(name: str) -> None:
+    try:
+        os.mkdir(name)
+    except FileExistsError:
+        pass
+
+def format_generic_arg(arg: dict) -> str:
+    match arg:
+        case {"type": typ}:
+            return format_type(typ)
+        case {"lifetime": lifetime}:
+            return lifetime
+        case {"const": const}:
+            return const["expr"]
+        case _:
+            pprint_json(arg)
+            assert False, "Unknown generic argument type!"
+
+def format_type(typ: dict) -> str:
+    match typ:
+        case {"primitive": name} | {"generic": name}:
+            return name
+        case {"borrowed_ref": {"is_mutable": is_mut, "lifetime": lifetime, "type": child}}:
+            ret = "&"
+            if lifetime is not None:
+                ret += lifetime + " "
+            if is_mut:
+                ret += "mut "
+            ret += format_type(child)
+            return ret
+        case {"slice": elem_type}:
+            return f"[{format_type(elem_type)}]"
+        case {"resolved_path": {"path": path, "args": {"angle_bracketed": {"args": args}}}}:
+            ret = path
+            if args:
+                ret += "<" + ", ".join(format_generic_arg(arg) for arg in args) + ">"
+            return ret
+        case {"qualified_path": q}:
+            return format_type(q["self_type"]) + "::" + q["name"]
+        case {"impl_trait": trait_bound}:
+            return "impl TODO"
+        case {"dyn_trait": _}:
+            return "dyn TODO"
+        case {"tuple": elems}:
+            return "(" + ", ".join(format_type(elem) for elem in elems) + ")"
+        case {"raw_pointer": {"is_mutable": is_mutable, "type": inner}}:
+            mutability = "mut" if is_mutable else "const"
+            return f"*{mutability} {format_type(inner)}"
+        case {"function_pointer": function_pointer}:
+            return format_fn(function_pointer, None)
+        case {"array": {"type": inner, "len": count}}:
+            return f"[{format_type(inner)}; {count}]"
+        case _:
+            pprint_json(typ)
+            assert False, "Unknown type type!"
+
+def find_fn_impl(index: dict, fn_key: int) -> str | None:
+    for key, value in index.items():
+        inner = value["inner"]
+        if "impl" in inner:
+            if fn_key in inner["impl"]["items"]:
+                return key
+    return None
+
+def get_qual_name(qual: list, name: str) -> str:
+    return "::".join(name for typ, name in qual + [["", name]])
+
+def compute_qual_names(index: dict, root: int, curr=[]):
+    item = index[str(root)]
+    name = item["name"]
+    item["qual"] = curr
+    match item["inner"]:
+        case {"module": module}:
+            typ = "crate" if module["is_crate"] else "mod"
+            for child in module["items"]:
+                compute_qual_names(index, child, curr + [[typ, name]])
+        case {"struct": struct}:
+            for impl in struct["impls"]:
+                compute_qual_names(index, impl, curr + [["impl", name]])
+        case {"impl": impl}:
+            for item in impl["items"]:
+                compute_qual_names(index, item, curr)
+
+def format_struct_or_variant(index: dict, struct: dict, terminator: str = ";") -> str:
+    match struct["kind"]:
+        case "unit" | "plain":
+            return terminator + "\n.br"
+        case {"tuple": elems}:
+            formatted_elems = ", ".join(format_type(index[str(elem)]["inner"]["struct_field"]) for elem in elems if elem is not None)
+            return f"({formatted_elems}){terminator}\n.br"
+        case {"plain": {"fields": fields, "has_stripped_fields": has_stripped_fields}} | {"struct": {"fields": fields, "has_stripped_fields": has_stripped_fields}}:
+            ret = " {\n.RS\n"
+            for field_key in fields:
+                field = index[str(field_key)]
+                ret += f"{field['name']}: {format_type(field['inner']['struct_field'])},\n.br"
+            if has_stripped_fields:
+                ret += "/* private fields */\n.br\n"
+            ret += ".RE\n}\n.br"
+            return ret
+        case other:
+            assert False, f"Unknown struct kind: {other}"
+
+def format_generics(generics: dict) -> str:
+    if generics["params"] == []:
+        return ""
+    else:
+        return "<" + ", ".join(param["name"] for param in generics["params"]) + ">"
+
+def format_abi(abi: str | dict) -> str:
+    match abi:
+        case str(abi):
+            return '"' + abi + '"'
+        case {}:
+            return '"' + next(iter(abi.keys())) + '"'
+
+def format_fn(fn: dict, name: str | None) -> str:
+    signature = fn["sig"]
+    header = fn["header"]
+    # `pub`, `default`, `const`, `async`, `unsafe`, `extern`
+    keywords = []
+    if header["is_const"]:
+        keywords.append("const")
+    if header["is_async"]:
+        keywords.append("async")
+    if header["is_unsafe"]:
+        keywords.append("unsafe")
+    if header["abi"] != "Rust":
+        keywords.append(f"extern {format_abi(header['abi'])}")
+    keywords.append("fn")
+
+    ret = " ".join(keywords)
+    if name is not None:
+        ret += " " + name
+    ret += "("
+    for i, (name, typ) in enumerate(signature["inputs"]):
+        if i != 0:
+            ret += ", "
+        if name:
+            ret += f"{name}: {format_type(typ)}"
+        else:
+            ret += format_type(typ)
+    if signature["output"] is not None:
+        ret += f") -> {format_type(signature['output'])}"
+    else:
+        ret += ")"
+    return ret
+
+def format_item(index: dict, item: dict, f: IO[str]):
+    name = item["name"]
+    #for attr in item["attrs"]:
+    #    print(attr, file=f, end="\n.br")
+    try:
+        match item["inner"]:
+            case {"primitive": {"name": name}}:
+                print(f"<primitive {name}>\n.br", file=f)
+            case {"macro": macro}:
+                print(".EX", file=f)
+                print(macro, file=f)
+                print(".EE", file=f)
+            case {"proc_macro": {"kind": "derive"}}:
+                print(f"#[derive({name})]", file=f)
+            case {"function": function}:
+                print(format_fn(function, name) + ";\n.br", file=f)
+            case {"struct": struct}:
+                print(f"struct {name}", end="", file=f)
+                print(format_generics(struct["generics"]), end="", file=f)
+                print(format_struct_or_variant(index, struct, terminator=";"), file=f)
+            case {"assoc_const": {"type": typ, "value": val}}:
+                print(f"const {name}: {format_type(typ)} = {val};", file=f)
+            case {"constant": {"type": typ, "const": {"expr": expr}}}:
+                print(f"const {name}: {format_type(typ)} = {expr};\n.br", file=f)
+            case {"assoc_type": {"type": typ}}:
+                if typ is None:
+                    print(f"type {name};", file=f)
+                else:
+                    print(f"type {name} = {format_type(typ)}", file=f)
+            case {"type_alias": {"type": typ, "generics": generics}}:
+                print(f"type {name}{format_generics(generics)} = {format_type(typ)};\n.br", file=f)
+            case {"trait": trait}:
+                print(f"trait {name} {{", file=f)
+                print(".RS", file=f)
+
+                for item_key in trait["items"]:
+                    format_item(index, index[str(item_key)], f)
+
+                print(".RE", file=f)
+                print("}\n.br", file=f)
+            case {"enum": enum}:
+                print(f"enum {name}{format_generics(enum['generics'])} {{", file=f)
+                print(".RS", file=f)
+
+                for variant_key in enum["variants"]:
+                    variant = index[str(variant_key)]
+                    print(variant["name"] + format_struct_or_variant(index, index[str(variant_key)]["inner"]["variant"], terminator=","), file=f, end="\n.br")
+
+                print("\n.RE", file=f)
+                print("}\n.br", file=f)
+            case {"module": {"is_crate": is_crate, "items": items}}:
+                kw = "crate" if is_crate else "mod"
+                print(f"{kw} {name} {{", file=f)
+                print(".RS", file=f)
+
+                for item_key in items:
+                    format_item(index, index[str(item_key)], f)
+
+                print(".RE", file=f)
+                print("}\n.br", file=f)
+            case {"use": _}:
+                # TODO: handle re-exports
+                pass
+            case _:
+                assert False, "unknown item type"
+    except:
+        print("--- ERROR WHILE PROCESSING THE FOLLOWING ITEM ---")
+        pprint_json(item)
+        print("-------------------------------------------------")
+        raise
+
+def main() -> None:
+    dirname = "man"
+
+    mkdir_if_not_exists(dirname)
+
+    with open(sys.argv[1], "r") as f:
+        file = json.load(f)
+    index = file["index"]
+    compute_qual_names(index, file["root"])
+    for key, value in index.items():
+        if value["crate_id"] != 0:
+            continue
+
+        name = value["name"]
+        if name is None or "qual" not in value:
+            continue
+        qual_name = get_qual_name(value["qual"], name)
+        with open(os.path.join(dirname, f"{qual_name}.3"), "w") as f:
+            print(f".TH {qual_name} 3", file=f)
+            print(".SH NAME", file=f)
+            if value["docs"] is None:
+                print(f"{qual_name}", file=f)
+            else:
+                short_desc = value["docs"].splitlines()[0]
+                print(f"{qual_name} \\- {short_desc}", file=f)
+            print(".SH SYNOPSIS", file=f)
+            print(".P", file=f)
+
+            for kw, ident in value["qual"]:
+                print(f"{kw} {ident} {{", file=f)
+                print(".RS", file=f)
+            format_item(index, value, f)
+            for kw, ident in value["qual"]:
+                print(".RE", file=f)
+                print("}", file=f)
+
+            print(".SH DESCRIPTION", file=f)
+            print(".EX", file=f)
+            print(value['docs'], file=f)
+            print(".EE", file=f)
+
+            print(".SH JSON", file=f)
+            print(".EX", file=f)
+            json.dump(value, f, indent=4)
+            print("\n.EE", file=f)
+
+if __name__ == "__main__":
+    main()
+
